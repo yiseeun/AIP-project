@@ -47,39 +47,106 @@ train_dataset = train_dataset.shuffle(buffer_size=len(train_data)).batch(BATCH_S
 test_dataset = tf.data.Dataset.from_tensor_slices((test_data_noisy, test_data))
 test_dataset = test_dataset.batch(BATCH_SIZE)
 
-input_layer = Input(shape=(MAX_LEN,))
-embedding_layer = Embedding(VOCAB_SIZE, EMBEDDING_DIM, mask_zero=True)(input_layer)
+# --- 텍스트 시퀀스용 GRU 기반 Encoder/Decoder 클래스 정의 ---
 
-# 인코더
-encoder_output, state_h = GRU(GRU_UNITS, return_sequences=False, return_state=True)(embedding_layer)
+class Encoder(tf.keras.layers.Layer):
+    def __init__(self, gru_units, embedding_dim, vocab_size, max_len):
+        super(Encoder, self).__init__()
+        self.embedding = Embedding(vocab_size, embedding_dim, input_length=max_len, mask_zero=True)
+        self.gru = GRU(gru_units, return_sequences=False, return_state=True, name='encoder_gru')
 
-# 디코더
-decoder_input = embedding_layer 
-decoder_gru = GRU(GRU_UNITS, return_sequences=True)(decoder_input, initial_state=state_h)
+    def call(self, input_features):
+        embedded = self.embedding(input_features)
+        # GRU의 최종 상태(state_h)를 인코딩된 잠재 벡터로 사용
+        output_sequence, state_h = self.gru(embedded)
+        return state_h, embedded
 
-# 출력 레이어
-decoder_output = TimeDistributed(Dense(VOCAB_SIZE, activation='softmax'))(decoder_gru)
+class Decoder(tf.keras.layers.Layer):
+    def __init__(self, gru_units, vocab_size):
+        super(Decoder, self).__init__()
+        self.gru = GRU(gru_units, return_sequences=True, name='decoder_gru')
+        self.output_layer = TimeDistributed(Dense(vocab_size, activation='softmax'))
 
-model = Model(inputs=input_layer, outputs=decoder_output)
+    def call(self, decoder_input_and_state):
+        embedded_input, initial_state = decoder_input_and_state
+        gru_output = self.gru(embedded_input, initial_state=initial_state)
+        return self.output_layer(gru_output)
 
+class Autoencoder(tf.keras.Model):
+    def __init__(self, vocab_size, max_len, embedding_dim, gru_units):
+        super(Autoencoder, self).__init__()
+        self.loss_history = [] # 이전 코드의 self.loss를 대체
+        self.encoder = Encoder(gru_units, embedding_dim, vocab_size, max_len)
+        self.decoder = Decoder(gru_units, vocab_size)
 
-# 옵티마이저 설정: Adam (Learning Rate = 0.001)
-optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+    def call(self, input_features):
+        state_h, embedded_input = self.encoder(input_features)
+        reconstructed = self.decoder((embedded_input, state_h))
+        return reconstructed
 
-# 손실 함수 설정: Sparse Categorical Crossentropy (정수 인코딩, 패딩 토큰(0) 무시)
+# --- 모델 초기화 및 학습 ---
+model = Autoencoder(VOCAB_SIZE, MAX_LEN, EMBEDDING_DIM, GRU_UNITS)
+
+# 옵티마이저 설정
+opt = Adam(learning_rate=LEARNING_RATE)
+
+# 손실 함수 설정: Sparse Categorical Crossentropy (텍스트 시퀀스 복원에 적합)
 loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(
-    from_logits=False, 
-    ignore_class=0 
+    from_logits=False, 
+    ignore_class=0  # 패딩 토큰(0) 무시
 )
 
 model.compile(
-    optimizer=optimizer,
-    loss=loss_fn,
-    metrics=['accuracy']
+    optimizer=opt,
+    loss=loss_fn,
+    metrics=['accuracy']
 )
 
+# Keras의 표준 fit 메서드 사용 (수동 train_loop 대체)
+print("\n--- 모델 학습 시작 (GRU Denoising Autoencoder) ---")
 history = model.fit(
-    train_dataset,
-    epochs=EPOCHS,
-    validation_data=test_dataset
+    train_dataset,
+    epochs=EPOCHS,
+    validation_data=test_dataset
 )
+
+print("\n--- 모델 학습 완료 ---")
+
+# --- 시각화 (Loss 그래프) ---
+plt.plot(history.history['loss'])
+plt.plot(history.history['val_loss'])
+plt.title('Model Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend(['Train', 'Validation'], loc='upper right')
+plt.show()
+
+# --- 텍스트 복원 시각화 (이전 MNIST 시각화 대체) ---
+# 단어 인덱스 -> 단어 매핑을 위한 딕셔너리 준비
+word_index = imdb.get_word_index()
+index_to_word = {v + 3: k for k, v in word_index.items()}
+index_to_word[0] = "<PAD>"
+index_to_word[1] = "<START>"
+index_to_word[2] = "<UNK>"
+index_to_word[3] = "<UNUSED>"
+
+def decode_sequence(sequence, index_to_word):
+    return ' '.join([index_to_word.get(i, '?') for i in sequence if i > 3])
+
+# 테스트 데이터 샘플 선택 및 복원 확인
+sample_index = 5
+input_noisy = test_data_noisy[sample_index:sample_index+1]
+target_original = test_data[sample_index:sample_index+1]
+
+predictions = model.predict(input_noisy)
+predicted_sequence = np.argmax(predictions, axis=-1)[0]
+
+print("\n--- 복원 테스트 (샘플) ---")
+print(f"**잡음이 섞인 입력 (디코딩):**")
+print(' '.join([index_to_word.get(i, '?') for i in input_noisy[0] if i != 0]))
+
+print("\n**원본 타겟 (디코딩):**")
+print(decode_sequence(target_original[0], index_to_word))
+
+print("\n**복원된 예측 시퀀스 (디코딩):**")
+print(decode_sequence(predicted_sequence, index_to_word))
