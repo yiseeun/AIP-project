@@ -5,6 +5,7 @@ from tensorflow.keras.datasets import imdb
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Embedding, GRU, Dense, TimeDistributed
+import matplotlib.pyplot as plt
 
 # 2. 설정값
 VOCAB_SIZE = 10000   # 사용할 단어 개수 (상위 10,000개)
@@ -12,7 +13,9 @@ MAX_LEN = 100        # 문장 최대 길이
 NOISE_RATIO = 0.3    # 단어를 지울 확률
 BATCH_SIZE = 128
 EMBEDDING_DIM = 128  # 추가 설정값: 임베딩 차원
-GRU_UNITS = 128      # 추가 설정값: GRU 유닛 수
+D_MODEL = EMBEDDING_DIM  # CNN 채널 수
+N_BLOCKS = 6             # Dilated Residual 블록 수
+KERNEL_SIZE = 3
 EPOCHS = 10          # 학습 파라미터: 에포크 수
 
 # 3. 데이터 로드(IMDB)
@@ -40,76 +43,94 @@ def add_noise(sequences, noise_ratio=0.1):
 train_data_noisy = add_noise(train_data, NOISE_RATIO)
 test_data_noisy  = add_noise(test_data,  NOISE_RATIO)
 
-# 6. 학습용 Dataset 생성
-train_dataset = tf.data.Dataset.from_tensor_slices((train_data_noisy, train_data))
-train_dataset = train_dataset.shuffle(buffer_size=len(train_data)).batch(BATCH_SIZE)
+# 6. 학습용 Dataset 생성 (PAD=0은 손실에서 제외)
+def make_ds(x_noisy, y_clean, batch_size, shuffle=False):
+    sample_weight = (y_clean != 0).astype("float32")  # PAD=0 → weight=0
+    ds = tf.data.Dataset.from_tensor_slices((x_noisy, y_clean, sample_weight))
+    if shuffle:
+        ds = ds.shuffle(buffer_size=len(x_noisy), seed=0)
+    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return ds
 
-test_dataset = tf.data.Dataset.from_tensor_slices((test_data_noisy, test_data))
-test_dataset = test_dataset.batch(BATCH_SIZE)
+train_dataset = make_ds(train_data_noisy, train_data, BATCH_SIZE, shuffle=True)
+test_dataset  = make_ds(test_data_noisy,  test_data,  BATCH_SIZE, shuffle=False)
 
-# --- 텍스트 시퀀스용 GRU 기반 Encoder/Decoder 클래스 정의 ---
+# 7. 모델 구조: Residual Dilated 1D CNN (channels_last: (B,T,C))
+class ResidualDilatedBlock(tf.keras.layers.Layer):
+    def __init__(self, channels, kernel_size=3, dilation=1, dropout=0.2, use_glu=True, norm="batch"):
+        super().__init__()
+        assert kernel_size % 2 == 1, "kernel_size는 홀수를 권장합니다다."
+        self.use_glu = use_glu
+        self.dropout = tf.keras.layers.Dropout(dropout)
+        self.norm_type = norm
 
-class Encoder(tf.keras.layers.Layer):
-    def __init__(self, gru_units, embedding_dim, vocab_size, max_len):
-        super(Encoder, self).__init__()
-        self.embedding = Embedding(vocab_size, embedding_dim, input_length=max_len, mask_zero=True)
-        self.gru = GRU(gru_units, return_sequences=False, return_state=True, name='encoder_gru')
+        # dilated Conv1D (same padding)
+        self.conv = tf.keras.layers.Conv1D(
+            filters=channels * (2 if use_glu else 1),
+            kernel_size=kernel_size,
+            dilation_rate=dilation,
+            padding="same"
+        )
+        # 1x1 Conv to project back to channels
+        self.proj = tf.keras.layers.Conv1D(filters=channels, kernel_size=1, padding="same")
 
-    def call(self, input_features):
-        embedded = self.embedding(input_features)
-        # GRU의 최종 상태(state_h)를 인코딩된 잠재 벡터로 사용
-        output_sequence, state_h = self.gru(embedded)
-        return state_h, embedded
+        if norm == "batch":
+            self.norm = tf.keras.layers.BatchNormalization()
+        elif norm == "layer":
+            self.norm = tf.keras.layers.LayerNormalization()
+        else:
+            raise ValueError("norm must be 'batch' or 'layer'")
 
-class Decoder(tf.keras.layers.Layer):
-    def __init__(self, gru_units, vocab_size):
-        super(Decoder, self).__init__()
-        self.gru = GRU(gru_units, return_sequences=True, name='decoder_gru')
-        self.output_layer = TimeDistributed(Dense(vocab_size, activation='softmax'))
+    def call(self, x, training=False):
+        # x: (B,T,C)
+        h = self.conv(x)  # (B,T,2C or C)
+        if self.use_glu:
+            a, b = tf.split(h, num_or_size_splits=2, axis=-1)  # (B,T,C),(B,T,C)
+            h = a * tf.sigmoid(b)
+        h = self.proj(h)                # (B,T,C)
+        h = self.dropout(h, training=training)
+        h = h + x                       # residual
+        h = self.norm(h, training=training)
+        return h
 
-    def call(self, decoder_input_and_state):
-        embedded_input, initial_state = decoder_input_and_state
-        gru_output = self.gru(embedded_input, initial_state=initial_state)
-        return self.output_layer(gru_output)
+# CNN Denoiser Model 
+def build_cnn_denoiser(vocab_size, d_model=256, n_blocks=6, kernel_size=3, dropout=0.2, use_glu=True, norm="batch"):
+    inp = tf.keras.Input(shape=(MAX_LEN,), dtype="int32")          # (B,T)
+    emb = tf.keras.layers.Embedding(vocab_size, d_model, mask_zero=True)(inp)  # (B,T,C)
 
-class Autoencoder(tf.keras.Model):
-    def __init__(self, vocab_size, max_len, embedding_dim, gru_units):
-        super(Autoencoder, self).__init__()
-        self.loss_history = [] # 이전 코드의 self.loss를 대체
-        self.encoder = Encoder(gru_units, embedding_dim, vocab_size, max_len)
-        self.decoder = Decoder(gru_units, vocab_size)
+    # Keras Conv1D는 mask를 자동 전파하지 않음, sample_weight로 PAD를 무시
+    x = emb
+    dilations = [1] + [2**i for i in range(1, n_blocks)]
+    for d in dilations[:n_blocks]:
+        x = ResidualDilatedBlock(d_model, kernel_size, dilation=d, dropout=dropout, use_glu=use_glu, norm=norm)(x)
 
-    def call(self, input_features):
-        state_h, embedded_input = self.encoder(input_features)
-        reconstructed = self.decoder((embedded_input, state_h))
-        return reconstructed
+    # 최종 분류 (각 위치 -> vocab 점수). 
+    logits = tf.keras.layers.Dense(vocab_size, activation=None)(x)  # (B,T,V)
+    return tf.keras.Model(inp, logits, name="CNN_Denoiser")
 
-# --- 모델 초기화 및 학습 ---
-model = Autoencoder(VOCAB_SIZE, MAX_LEN, EMBEDDING_DIM, GRU_UNITS)
-
-# 옵티마이저 설정
-opt = Adam(learning_rate=LEARNING_RATE)
-
-# 손실 함수 설정: Sparse Categorical Crossentropy (텍스트 시퀀스 복원에 적합)
-loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(
-    from_logits=False, 
-    ignore_class=0  # 패딩 토큰(0) 무시
+# 모델 생성
+model = build_cnn_denoiser(
+    vocab_size=VOCAB_SIZE,
+    d_model=D_MODEL,
+    n_blocks=N_BLOCKS,
+    kernel_size=KERNEL_SIZE,
+    dropout=0.2,
+    use_glu=True,
+    norm="batch",
 )
+model.summary()
 
-model.compile(
-    optimizer=opt,
-    loss=loss_fn,
-    metrics=['accuracy']
-)
+# 옵티마이저
+optimizer = tf.keras.optimizers.Adam(learning_rate=2e-4)
 
-# Keras의 표준 fit 메서드 사용 (수동 train_loop 대체)
-print("\n--- 모델 학습 시작 (GRU Denoising Autoencoder) ---")
-history = model.fit(
-    train_dataset,
-    epochs=EPOCHS,
-    validation_data=test_dataset
-)
+# from_logits=True (Dense에 activation=None이므로)
+loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
 
+model.compile(optimizer=optimizer, loss=loss_fn, metrics=["accuracy"])
+
+
+print("\n--- 모델 학습 시작 (CNN Denoising Autoencoder) ---")
+history = model.fit(train_dataset, epochs=EPOCHS, validation_data=test_dataset)
 print("\n--- 모델 학습 완료 ---")
 
 # --- 시각화 (Loss 그래프) ---
